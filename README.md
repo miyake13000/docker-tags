@@ -1,7 +1,7 @@
 # docker-tags
 Print tags of docker image
 
-## Apply to docker
+## Install (apply to docker)
 This tool support docker-cli-plugin, so you can use like
 ```bash
 docker tags alpine
@@ -13,10 +13,12 @@ If you want to use below, install this plugin into
 # For local user
 mkdir -p $HOME/.docker/cli-plugins
 wget -P $HOME/.docker/cli-plugins/ http://github.com/miyake13000/docker-tags/releases/latest/download/docker-tags
+chmod +x $HOME/.docker/cli-plugins/docker-tags
 
 # For all user
 sudo mkdir -p /usr/local/lib/docker/cli-plugins
-wget -P /usr/local/lib/docker/cli-plugins http://github.com/miyake13000/docker-tags/releases/latest/download/docker-tags
+sudo wget -P /usr/local/lib/docker/cli-plugins http://github.com/miyake13000/docker-tags/releases/latest/download/docker-tags
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-tags
 ```
 
 ## Usage
