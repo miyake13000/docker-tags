@@ -1,7 +1,10 @@
 use clap::Parser;
+use futures::future::join_all;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use std::env::args;
 use std::io::{stdout, IsTerminal};
+use std::process::exit;
 
 const DOCKER_SPECIFIED_SUBCOMMAND: &str = "docker-cli-plugin-metadata";
 const DOCKERHUB_API_PREFIX: &str = "https://registry.hub.docker.com/v2/repositories";
@@ -11,95 +14,101 @@ const DOCKER_CLI_META_DATA: MetaData = MetaData {
     Version: env!("CARGO_PKG_VERSION"),
     ShortDescription: env!("CARGO_PKG_DESCRIPTION"),
 };
+const N_TAGS_PER_FETCH: u64 = 100;
 
-fn main() -> std::result::Result<(), ()> {
+#[tokio::main]
+async fn main() {
     // Parse cmdline args
-    let mut args = Args::parse();
-
-    // Change image if this program is used by docker plugin (ex: docker tags "IMAGE_NAME")
-    if args.image == "tags" {
-        if args.image_sub.is_some() {
-            args.image = args.image_sub.unwrap();
-        } else {
-            Args::parse_from(vec![""]);
-            return Err(());
-        }
-    }
+    let raw_args: Vec<String> = args().collect();
+    let args = if raw_args.get(1).is_some_and(|arg| arg == "tags") {
+        Args::parse_from(&raw_args[1..])
+    } else {
+        Args::parse_from(&raw_args)
+    };
 
     // Print metadata if "docker-cli-plugin-metadata" is specified
     if args.image == DOCKER_SPECIFIED_SUBCOMMAND {
         let metadata_json = serde_json::to_string(&DOCKER_CLI_META_DATA).unwrap();
         println!("{}", metadata_json);
-        return Ok(());
+        exit(0);
     }
 
     // Format URI with specified image nmae
-    let mut uri = match args.image.chars().filter(|c| *c == '/').count() {
-        0 => format!(
-            "{}/library/{}/tags?page_size=10000",
-            DOCKERHUB_API_PREFIX, args.image
-        ),
-        1 => format!(
-            "{}/{}/tags?page_size=10000",
-            DOCKERHUB_API_PREFIX, args.image
-        ),
+    let uri = match args.image.chars().filter(|c| *c == '/').count() {
+        0 => format!("{}/library/{}/tags", DOCKERHUB_API_PREFIX, args.image),
+        1 => format!("{}/{}/tags", DOCKERHUB_API_PREFIX, args.image),
         2 => {
             eprintln!("Registry other than DockerHub not supported yet");
-            return Err(());
+            exit(1);
         }
         _ => {
             eprintln!("{} is invalid image name", args.image);
-            return Err(());
+            exit(1);
         }
     };
 
-    let is_terminal = stdout().is_terminal();
-    let mut progress: Option<ProgressBar> = None;
-    let mut tags: Vec<Tag> = vec![];
-    loop {
-        // Get tag data from specified URI
-        let res = reqwest::blocking::get(uri).unwrap();
+    // Get response from specified URI
+    let first_uri = format!("{}?page_size=1", uri);
+    let res = reqwest::get(first_uri).await.unwrap();
 
-        // Exit if response is not ok
-        if res.status() != 200 {
-            eprintln!("Failed to fetch tags");
-            eprintln!("{}", res.text().unwrap());
-            return Err(());
-        }
-
-        // Deserialize response into Res struct
-        let body = res.text().unwrap();
-        let mut res: Res = serde_json::from_str(&body).unwrap();
-
-        // Show progress bar if it is not created and stdin is terminal
-        if progress.is_none() && is_terminal {
-            let pb = ProgressBar::new(res.count).with_style(
-                ProgressStyle::default_bar()
-                    .template(
-                        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}",
-                    )
-                    .unwrap(),
-            );
-            pb.enable_steady_tick(std::time::Duration::from_millis(10));
-            progress = Some(pb);
-        }
-
-        // Increment progress with the number of fetched tags
-        if let Some(pb) = &progress {
-            pb.inc(res.results.len().try_into().unwrap());
-        }
-
-        // Store fetched tags
-        tags.append(&mut res.results);
-
-        // Break loop if all tags are fetched
-        if res.next.is_none() {
-            break;
-        }
-
-        // Continue next loop with new URI
-        uri = res.next.unwrap()
+    // Exit if response is not ok
+    if res.status() != 200 {
+        eprintln!("Failed to fetch tags");
+        eprintln!("{}", res.text().await.unwrap());
+        exit(1);
     }
+
+    // Deserialize response into Res struct
+    let res: Res = res.json().await.unwrap();
+
+    // Show progress bar if it is not created and stdin is terminal
+    let progress = if stdout().is_terminal() {
+        let pb = ProgressBar::new(res.count).with_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}")
+                .unwrap(),
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(10));
+        Some(pb)
+    } else {
+        None
+    };
+
+    let mut tasks = Vec::new();
+    let last_page = (res.count as f32 / N_TAGS_PER_FETCH as f32).ceil() as usize;
+    for i in 0..last_page {
+        let uri = &uri;
+        let progress = &progress;
+        let task = async move {
+            // Set own URI
+            let uri = format!("{}?page_size={}&page={}", uri, N_TAGS_PER_FETCH, i + 1);
+
+            // Get tag data from specified URI
+            let res = reqwest::get(uri).await.unwrap();
+
+            // Exit if response is not ok
+            if res.status() != 200 {
+                eprintln!("Failed to fetch tags");
+                eprintln!("{}", res.text().await.unwrap());
+                exit(1);
+            }
+
+            // Deserialize response into Res struct
+            let res: Res = res.json().await.unwrap();
+
+            // Increment progress with the number of fetched tags
+            if let Some(pb) = &progress {
+                pb.inc(res.results.len().try_into().unwrap());
+            }
+
+            res.results
+        };
+
+        tasks.push(task);
+    }
+
+    // Wait for all tasks to finish
+    let tags: Vec<Tag> = join_all(tasks).await.into_iter().flatten().collect();
 
     // Clear progress bar
     if let Some(pb) = progress {
@@ -115,8 +124,6 @@ fn main() -> std::result::Result<(), ()> {
             println!("{}", tag.name);
         }
     }
-
-    Ok(())
 }
 
 #[derive(Parser, Debug)]
@@ -125,14 +132,12 @@ struct Args {
     /// Image name (ex: alpine, library/ubuntu)
     image: String,
 
-    #[arg(hide = true)]
-    image_sub: Option<String>,
-
     #[arg(short = 'u', long = "print-updated")]
     /// Print last updated time of image
     update: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct Res {
     count: u64,
