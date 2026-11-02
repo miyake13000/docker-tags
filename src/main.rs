@@ -72,7 +72,7 @@ async fn run() -> Result<(), String> {
     };
 
     let mut tasks = Vec::new();
-    let last_page = (res.count as f32 / N_TAGS_PER_FETCH as f32).ceil() as usize;
+    let last_page = res.count.div_ceil(N_TAGS_PER_FETCH);
     for i in 0..last_page {
         let uri = &uri;
         let progress = &progress;
