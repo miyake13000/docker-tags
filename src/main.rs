@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::env::args;
 use std::io::{stdout, IsTerminal};
 use std::process::exit;
+use std::time::Duration;
 
 const DOCKER_SPECIFIED_SUBCOMMAND: &str = "docker-cli-plugin-metadata";
 const DOCKERHUB_API_PREFIX: &str = "https://registry.hub.docker.com/v2/repositories";
@@ -16,6 +17,8 @@ const DOCKER_CLI_META_DATA: MetaData = MetaData {
 };
 const N_TAGS_PER_FETCH: u64 = 100;
 const MAX_CONCURRENT_FETCHES: usize = 8;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() {
@@ -54,9 +57,15 @@ async fn run() -> Result<(), String> {
         }
     };
 
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| format!("Failed to create HTTP client: {error}"))?;
+
     // Get response from specified URI
     let first_uri = format!("{}?page_size=1", uri);
-    let res = fetch_tags(&first_uri).await?;
+    let res = fetch_tags(&client, &first_uri).await?;
 
     // Show progress bar if it is not created and stdin is terminal
     let progress = if stdout().is_terminal() {
@@ -74,6 +83,7 @@ async fn run() -> Result<(), String> {
     let mut tasks = Vec::new();
     let last_page = res.count.div_ceil(N_TAGS_PER_FETCH);
     for i in 0..last_page {
+        let client = &client;
         let uri = &uri;
         let progress = &progress;
         let task = async move {
@@ -81,7 +91,7 @@ async fn run() -> Result<(), String> {
             let uri = format!("{}?page_size={}&page={}", uri, N_TAGS_PER_FETCH, i + 1);
 
             // Fetch tags with asynchronously
-            let res = fetch_tags(&uri).await?;
+            let res = fetch_tags(client, &uri).await?;
 
             // Increment progress with the number of fetched tags
             if let Some(pb) = &progress {
@@ -187,8 +197,10 @@ fn format_tags(tags: &[Tag], args: &Args) -> Result<TagOutput, String> {
     })
 }
 
-async fn fetch_tags(uri: &str) -> Result<Res, String> {
-    let response = reqwest::get(uri)
+async fn fetch_tags(client: &reqwest::Client, uri: &str) -> Result<Res, String> {
+    let response = client
+        .get(uri)
+        .send()
         .await
         .map_err(|error| format!("Failed to fetch tags from {uri}: {error}"))?;
     let status = response.status();
