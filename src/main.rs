@@ -107,16 +107,84 @@ async fn run() -> Result<(), String> {
         pb.finish_and_clear();
     }
 
-    // Print all tags only after every page has been fetched successfully
-    for tag in pages?.into_iter().flatten() {
-        if args.update {
-            let last_updated: Vec<&str> = tag.last_updated.split('T').collect();
-            println!("{} ({})", tag.name, last_updated[0]);
-        } else {
-            println!("{}", tag.name);
-        }
+    let tags: Vec<Tag> = pages?.into_iter().flatten().collect();
+    let output = format_tags(&tags, &args)?;
+    for line in output.lines {
+        println!("{line}");
+    }
+    if output.unverified_tags > 0 {
+        eprintln!(
+            "warning: {} tags was skipped because their digest is empty",
+            output.unverified_tags
+        );
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct TagOutput {
+    lines: Vec<String>,
+    unverified_tags: usize,
+}
+
+fn format_tags(tags: &[Tag], args: &Args) -> Result<TagOutput, String> {
+    let show = args
+        .show_tag
+        .as_deref()
+        .or(args.show_latest.then_some("latest"));
+    let filter = args
+        .filter_tag
+        .as_deref()
+        .or(args.filter_latest.then_some("latest"));
+
+    let reference_digest = |name: &str| -> Result<&str, String> {
+        let tag = tags
+            .iter()
+            .find(|tag| tag.name == name)
+            .ok_or_else(|| format!("tag \"{name}\" not found"))?;
+        tag.digest
+            .as_deref()
+            .filter(|digest| !digest.trim().is_empty())
+            .ok_or_else(|| format!("digest unavailable for tag \"{name}\""))
+    };
+    let show_digest = show.map(&reference_digest).transpose()?;
+    let filter_digest = filter.map(&reference_digest).transpose()?;
+
+    let unverified_tags = if show.is_some() || filter.is_some() {
+        tags.iter()
+            .filter(|tag| {
+                tag.digest
+                    .as_deref()
+                    .is_none_or(|digest| digest.trim().is_empty())
+            })
+            .count()
+    } else {
+        0
+    };
+
+    let mut lines = Vec::new();
+    for tag in tags {
+        if let Some(name) = filter {
+            if tag.name == name || tag.digest.as_deref() != filter_digest {
+                continue;
+            }
+        }
+        let mut line = tag.name.clone();
+        if let Some(name) = show {
+            if tag.name != name && tag.digest.as_deref() == show_digest {
+                line.push_str(&format!(" ({name})"));
+            }
+        }
+        if args.update {
+            let date = tag.last_updated.split('T').next().unwrap_or("");
+            line.push_str(&format!(" ({date})"));
+        }
+        lines.push(line);
+    }
+    Ok(TagOutput {
+        lines,
+        unverified_tags,
+    })
 }
 
 async fn fetch_tags(uri: &str) -> Result<Res, String> {
@@ -149,6 +217,22 @@ struct Args {
     #[arg(short = 'u', long = "print-updated")]
     /// Print last updated time of image
     update: bool,
+
+    /// Annotate tags sharing the specified tag's digest
+    #[arg(long, value_name = "TAG", conflicts_with = "show_latest")]
+    show_tag: Option<String>,
+
+    /// Annotate tags sharing the latest tag's digest
+    #[arg(short = 's', long)]
+    show_latest: bool,
+
+    /// List other tags sharing the specified tag's digest
+    #[arg(long, value_name = "TAG", conflicts_with = "filter_latest")]
+    filter_tag: Option<String>,
+
+    /// List other tags sharing the latest tag's digest
+    #[arg(short = 'l', long)]
+    filter_latest: bool,
 }
 
 #[allow(dead_code)]
@@ -163,6 +247,7 @@ struct Res {
 struct Tag {
     last_updated: String,
     name: String,
+    digest: Option<String>,
 }
 
 #[allow(non_snake_case)]

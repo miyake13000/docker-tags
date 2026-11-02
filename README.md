@@ -40,6 +40,31 @@ latest
   :
   ```
 
+### Compare tags by digest
+
+- `--show-tag=TAG` annotates tags sharing TAG's digest with `(TAG)`.
+- `--show-latest` / `-s` is shorthand for `--show-tag=latest`.
+- `--filter-tag=TAG` lists tags sharing TAG's digest, excluding TAG itself.
+- `--filter-latest` / `-l` is shorthand for `--filter-tag=latest`.
+
+```bash
+$ docker tags -s ubuntu
+26.10
+26.04 (latest)
+...
+$ docker tags -l ubuntu
+26.04
+resolute
+$ docker tags --filter-tag=26.04 ubuntu
+latest (26.04)
+26.10
+...
+$ docker tags --show-tag=26.04 -u ubuntu
+latest
+resolute
+```
+
+
 ## Build
 ```bash
 git clone https://github.com/miyake13000/docker-tags && cd docker-tags
