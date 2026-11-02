@@ -1,5 +1,5 @@
 use clap::Parser;
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::env::args;
@@ -19,6 +19,13 @@ const MAX_CONCURRENT_FETCHES: usize = 8;
 
 #[tokio::main]
 async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("error: {}", error);
+        exit(1);
+    }
+}
+
+async fn run() -> Result<(), String> {
     // Parse cmdline args
     let raw_args: Vec<String> = args().collect();
     let args = if raw_args.get(1).is_some_and(|arg| arg == "tags") {
@@ -29,9 +36,10 @@ async fn main() {
 
     // Print metadata if "docker-cli-plugin-metadata" is specified
     if args.image == DOCKER_SPECIFIED_SUBCOMMAND {
-        let metadata_json = serde_json::to_string(&DOCKER_CLI_META_DATA).unwrap();
+        let metadata_json = serde_json::to_string(&DOCKER_CLI_META_DATA)
+            .map_err(|error| format!("Failed to serialize plugin metadata: {error}"))?;
         println!("{}", metadata_json);
-        exit(0);
+        return Ok(());
     }
 
     // Format URI with specified image nmae
@@ -39,35 +47,23 @@ async fn main() {
         0 => format!("{}/library/{}/tags", DOCKERHUB_API_PREFIX, args.image),
         1 => format!("{}/{}/tags", DOCKERHUB_API_PREFIX, args.image),
         2 => {
-            eprintln!("Registry other than DockerHub not supported yet");
-            exit(1);
+            return Err("Registry other than DockerHub not supported yet".into());
         }
         _ => {
-            eprintln!("{} is invalid image name", args.image);
-            exit(1);
+            return Err(format!("{} is invalid image name", args.image));
         }
     };
 
     // Get response from specified URI
     let first_uri = format!("{}?page_size=1", uri);
-    let res = reqwest::get(first_uri).await.unwrap();
-
-    // Exit if response is not ok
-    if res.status() != 200 {
-        eprintln!("Failed to fetch tags");
-        eprintln!("{}", res.text().await.unwrap());
-        exit(1);
-    }
-
-    // Deserialize response into Res struct
-    let res: Res = res.json().await.unwrap();
+    let res = fetch_tags(&first_uri).await?;
 
     // Show progress bar if it is not created and stdin is terminal
     let progress = if stdout().is_terminal() {
         let pb = ProgressBar::new(res.count).with_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len}")
-                .unwrap(),
+                .map_err(|error| format!("Failed to configure progress bar: {error}"))?,
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(10));
         Some(pb)
@@ -84,46 +80,35 @@ async fn main() {
             // Set own URI
             let uri = format!("{}?page_size={}&page={}", uri, N_TAGS_PER_FETCH, i + 1);
 
-            // Get tag data from specified URI
-            let res = reqwest::get(uri).await.unwrap();
-
-            // Exit if response is not ok
-            if res.status() != 200 {
-                eprintln!("Failed to fetch tags");
-                eprintln!("{}", res.text().await.unwrap());
-                exit(1);
-            }
-
-            // Deserialize response into Res struct
-            let res: Res = res.json().await.unwrap();
+            // Fetch tags with asynchronously
+            let res = fetch_tags(&uri).await?;
 
             // Increment progress with the number of fetched tags
             if let Some(pb) = &progress {
-                pb.inc(res.results.len().try_into().unwrap());
+                let count = u64::try_from(res.results.len())
+                    .map_err(|error| format!("Invalid tag count: {error}"))?;
+                pb.inc(count);
             }
 
-            res.results
+            Ok::<_, String>(res.results)
         };
 
         tasks.push(task);
     }
 
     // Fetch up to eight pages concurrently while preserving page order
-    let tags: Vec<Tag> = stream::iter(tasks)
+    let pages: Result<Vec<Vec<Tag>>, String> = stream::iter(tasks)
         .buffered(MAX_CONCURRENT_FETCHES)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
+        .try_collect()
+        .await;
 
     // Clear progress bar
     if let Some(pb) = progress {
         pb.finish_and_clear();
     }
 
-    // Print all tags
-    for tag in tags {
+    // Print all tags only after every page has been fetched successfully
+    for tag in pages?.into_iter().flatten() {
         if args.update {
             let last_updated: Vec<&str> = tag.last_updated.split('T').collect();
             println!("{} ({})", tag.name, last_updated[0]);
@@ -131,6 +116,28 @@ async fn main() {
             println!("{}", tag.name);
         }
     }
+    Ok(())
+}
+
+async fn fetch_tags(uri: &str) -> Result<Res, String> {
+    let response = reqwest::get(uri)
+        .await
+        .map_err(|error| format!("Failed to fetch tags from {uri}: {error}"))?;
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        let body = response.text().await.map_err(|error| {
+            format!(
+                "Failed to fetch tags from {uri}: HTTP {status}; failed to read response: {error}"
+            )
+        })?;
+        return Err(format!(
+            "Failed to fetch tags from {uri}: HTTP {status}\n{body}"
+        ));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| format!("Failed to decode tag response from {uri}: {error}"))
 }
 
 #[derive(Parser, Debug)]
