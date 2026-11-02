@@ -1,5 +1,5 @@
 use clap::Parser;
-use futures::future::join_all;
+use futures::{stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::env::args;
@@ -15,6 +15,7 @@ const DOCKER_CLI_META_DATA: MetaData = MetaData {
     ShortDescription: env!("CARGO_PKG_DESCRIPTION"),
 };
 const N_TAGS_PER_FETCH: u64 = 100;
+const MAX_CONCURRENT_FETCHES: usize = 8;
 
 #[tokio::main]
 async fn main() {
@@ -107,8 +108,14 @@ async fn main() {
         tasks.push(task);
     }
 
-    // Wait for all tasks to finish
-    let tags: Vec<Tag> = join_all(tasks).await.into_iter().flatten().collect();
+    // Fetch up to eight pages concurrently while preserving page order
+    let tags: Vec<Tag> = stream::iter(tasks)
+        .buffered(MAX_CONCURRENT_FETCHES)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
 
     // Clear progress bar
     if let Some(pb) = progress {
